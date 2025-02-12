@@ -8,7 +8,6 @@
 #include "contest_util.h"
 #include "contest_painting.h"
 #include "data.h"
-#include "decompress.h"
 #include "decoration.h"
 #include "decoration_inventory.h"
 #include "event_data.h"
@@ -32,7 +31,6 @@
 #include "mystery_event_script.h"
 #include "palette.h"
 #include "party_menu.h"
-#include "pokedex.h"
 #include "pokemon_storage_system.h"
 #include "random.h"
 #include "overworld.h"
@@ -54,6 +52,7 @@
 #include "list_menu.h"
 #include "malloc.h"
 #include "constants/event_objects.h"
+#include "constants/map_types.h"
 
 typedef u16 (*SpecialFunc)(void);
 typedef void (*NativeFunc)(struct ScriptContext *ctx);
@@ -658,12 +657,12 @@ bool8 ScrCmd_fadescreenswapbuffers(struct ScriptContext *ctx)
     case FADE_TO_BLACK:
     case FADE_TO_WHITE:
     default:
-        CpuCopy32(gPlttBufferUnfaded, gDecompressionBuffer, PLTT_SIZE);
+        CpuCopy32(gPlttBufferUnfaded, gPaletteDecompressionBuffer, PLTT_SIZE);
         FadeScreen(mode, 0);
         break;
     case FADE_FROM_BLACK:
     case FADE_FROM_WHITE:
-        CpuCopy32(gDecompressionBuffer, gPlttBufferUnfaded, PLTT_SIZE);
+        CpuCopy32(gPaletteDecompressionBuffer, gPlttBufferUnfaded, PLTT_SIZE);
         FadeScreen(mode, 0);
         break;
     }
@@ -1005,14 +1004,11 @@ bool8 ScrCmd_applymovement(struct ScriptContext *ctx)
     struct ObjectEvent *objEvent;
 
     // When applying script movements to follower, it may have frozen animation that must be cleared
-    if ((localId == OBJ_EVENT_ID_FOLLOWER && (objEvent = GetFollowerObject()) && objEvent->frozen) 
-            || ((objEvent = &gObjectEvents[GetObjectEventIdByLocalId(localId)]) && IS_OW_MON_OBJ(objEvent)))
+    if (localId == OBJ_EVENT_ID_FOLLOWER && (objEvent = GetFollowerObject()) && objEvent->frozen)
     {
         ClearObjectEventMovement(objEvent, &gSprites[objEvent->spriteId]);
         gSprites[objEvent->spriteId].animCmdIndex = 0; // Reset start frame of animation
     }
-
-    gObjectEvents[GetObjectEventIdByLocalId(localId)].directionOverwrite = DIR_NONE;
     ScriptMovement_StartObjectMovementScript(localId, gSaveBlock1Ptr->location.mapNum, gSaveBlock1Ptr->location.mapGroup, movementScript);
     sMovingNpcId = localId;
     objEvent = GetFollowerObject();
@@ -1037,7 +1033,6 @@ bool8 ScrCmd_applymovementat(struct ScriptContext *ctx)
     u8 mapGroup = ScriptReadByte(ctx);
     u8 mapNum = ScriptReadByte(ctx);
 
-    gObjectEvents[GetObjectEventIdByLocalId(localId)].directionOverwrite = DIR_NONE;
     ScriptMovement_StartObjectMovementScript(localId, mapNum, mapGroup, movementScript);
     sMovingNpcId = localId;
     return FALSE;
@@ -1296,7 +1291,6 @@ bool8 ScrCmd_releaseall(struct ScriptContext *ctx)
     ObjectEventClearHeldMovementIfFinished(&gObjectEvents[playerObjectId]);
     ScriptMovement_UnfreezeObjectEvents();
     UnfreezeObjectEvents();
-    gMsgBoxIsCancelable = FALSE;
     return FALSE;
 }
 
@@ -1315,7 +1309,6 @@ bool8 ScrCmd_release(struct ScriptContext *ctx)
     ObjectEventClearHeldMovementIfFinished(&gObjectEvents[playerObjectId]);
     ScriptMovement_UnfreezeObjectEvents();
     UnfreezeObjectEvents();
-    gMsgBoxIsCancelable = FALSE;
     return FALSE;
 }
 
@@ -1701,7 +1694,7 @@ bool8 ScrCmd_vmessage(struct ScriptContext *ctx)
 bool8 ScrCmd_bufferspeciesname(struct ScriptContext *ctx)
 {
     u8 stringVarIndex = ScriptReadByte(ctx);
-    u16 species = VarGet(ScriptReadHalfword(ctx)) & OBJ_EVENT_MON_SPECIES_MASK; // ignore possible shiny / form bits
+    u16 species = VarGet(ScriptReadHalfword(ctx)) & ((1 << 10) - 1); // ignore possible shiny / form bits
 
     StringCopy(sScriptStringVars[stringVarIndex], GetSpeciesName(species));
     return FALSE;
@@ -2481,72 +2474,70 @@ void ScriptSetDoubleBattleFlag(struct ScriptContext *ctx)
     sIsScriptedWildDouble = TRUE;
 }
 
-bool8 ScrCmd_removeallitem(struct ScriptContext *ctx)
+// follow me script commands
+#include "follow_me.h"
+bool8 ScrCmd_setfollower(struct ScriptContext *ctx)
 {
-    u32 itemId = VarGet(ScriptReadHalfword(ctx));
-    u32 count = CountTotalItemQuantityInBag(itemId);
-    gSpecialVar_Result = count;
-    RemoveBagItem(itemId, count);
+    u8 localId = ScriptReadByte(ctx);
+    u16 flags = ScriptReadHalfword(ctx);
+    u8 setScript = ScriptReadByte(ctx);
+    u16 battlePartner = ScriptReadHalfword(ctx);
 
+    gSaveBlock2Ptr->follower.battlePartner = battlePartner;
+    SetUpFollowerSprite(localId, flags, setScript);
     return FALSE;
 }
 
-bool8 ScrCmd_getobjectxy(struct ScriptContext *ctx)
+bool8 ScrCmd_destroyfollower(struct ScriptContext *ctx)
 {
-    u32 localId = VarGet(ScriptReadHalfword(ctx));
-    u32 useTemplate = VarGet(ScriptReadHalfword(ctx));
-    u16 *pX = GetVarPointer(ScriptReadHalfword(ctx));
-    u16 *pY = GetVarPointer(ScriptReadHalfword(ctx));
-    GetObjectPosition(pX, pY, localId, useTemplate);
-
+    gSaveBlock2Ptr->follower.battlePartner = 0;
+    DestroyFollower();
+    if (OW_FOLLOWERS_ENABLED == TRUE) {
+        UpdateFollowingPokemon();
+    }
     return FALSE;
 }
 
-bool8 ScrCmd_checkobjectat(struct ScriptContext *ctx)
+bool8 ScrCmd_facefollower(struct ScriptContext *ctx)
 {
-    u32 x = VarGet(ScriptReadHalfword(ctx)) + 7;
-    u32 y = VarGet(ScriptReadHalfword(ctx)) + 7;
-    u16 *varPointer = GetVarPointer(ScriptReadHalfword(ctx));
-
-    *varPointer = CheckObjectAtXY(x, y);
-
+    PlayerFaceFollowerSprite();
     return FALSE;
 }
 
-bool8 Scrcmd_getsetpokedexflag(struct ScriptContext *ctx)
+bool8 ScrCmd_checkfollower(struct ScriptContext *ctx)
 {
-    u32 speciesId = SpeciesToNationalPokedexNum(VarGet(ScriptReadHalfword(ctx)));
-    bool32 desiredFlag = VarGet(ScriptReadHalfword(ctx));
-    gSpecialVar_Result = GetSetPokedexFlag(speciesId, desiredFlag);
-
-    if (desiredFlag == FLAG_SET_CAUGHT)
-        GetSetPokedexFlag(speciesId, FLAG_SET_SEEN);
-
+    CheckPlayerHasFollower();
     return FALSE;
 }
 
-bool8 Scrcmd_checkspecies(struct ScriptContext *ctx)
+bool8 ScrCmd_updatefollowingmon(struct ScriptContext *ctx)
 {
-    u32 givenSpecies = VarGet(ScriptReadHalfword(ctx));
-    gSpecialVar_Result = CheckPartyHasSpecies(givenSpecies);
-
+    if (OW_FOLLOWERS_ENABLED == TRUE) {
+        UpdateFollowingPokemon();
+    }
     return FALSE;
 }
 
-bool8 Scrcmd_checkspecies_choose(struct ScriptContext *ctx)
+bool8 ScrCmd_ballfollowingmon(struct ScriptContext *ctx)
 {
-    u32 givenSpecies = VarGet(ScriptReadHalfword(ctx));
-    gSpecialVar_Result = (GetMonData(&gPlayerParty[gSpecialVar_0x8004], MON_DATA_SPECIES) == givenSpecies);
+    u16 species;
+    bool8 shiny;
+    u8 form;
 
-    return FALSE;
-}
-
-bool8 Scrcmd_getobjectfacingdirection(struct ScriptContext *ctx)
-{
-    u32 objectId = VarGet(ScriptReadHalfword(ctx));
-    u16 *varPointer = GetVarPointer(ScriptReadHalfword(ctx));
-
-    *varPointer = gObjectEvents[GetObjectEventIdByLocalId(objectId)].facingDirection;
-
+    if (OW_POKEMON_OBJECT_EVENTS == FALSE
+     || OW_FOLLOWERS_ENABLED == FALSE
+     || !GetFollowerInfo(&species, &form, &shiny)
+     || SpeciesToGraphicsInfo(species, form) == NULL
+     || (gMapHeader.mapType == MAP_TYPE_INDOOR && SpeciesToGraphicsInfo(species, form)->oam->size > ST_OAM_SIZE_2)
+     || FlagGet(FLAG_TEMP_HIDE_FOLLOWER)
+     || gSaveBlock2Ptr->follower.inProgress
+     || !FlagGet(FLAG_SYS_POKEMON_GET))
+    {
+        return FALSE;
+    }
+    else
+    {
+        ReturnFollowingMonToBall();
+    }
     return FALSE;
 }
